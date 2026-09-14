@@ -140,6 +140,7 @@ let casingLine: L.Polyline | undefined;
 	let frameScale = $state(1);
 	let mapHome: HTMLElement | null = null;
 	let prevExportView: { center: L.LatLng; zoom: number } | null = null;
+	let legendCols = $derived(legendColumns(exportLayout.legendW).cols);
 	let dragTarget = $state<'title' | 'logo' | 'legend' | null>(null);
 	let dragKind: 'move' | 'resize' | null = null;
 	let dragStart = { x: 0, y: 0, base: { x: 0, y: 0, w: 0 } };
@@ -149,6 +150,9 @@ let casingLine: L.Polyline | undefined;
 			leafletLib = L;
 			map = L.map(mapEl!, {
 			zoomControl: false,
+			zoomSnap: 0.25,
+			zoomDelta: 0.5,
+			wheelPxPerZoomLevel: 120,
 			attributionControl: false,
 			worldCopyJump: true
 		}).setView([47.8509991, 16.6255695], 12); // Start: Schützen am Gebirge
@@ -189,14 +193,38 @@ let casingLine: L.Polyline | undefined;
 		currentRouteCoords = [];
 	}
 
+	/** Start und Ziel am selben Ort? (gleiche Geokodierung) */
+	function startEqualsGoal(): boolean {
+		if (resolvedStops.length < 2) return false;
+		const a = resolvedStops[0];
+		const b = resolvedStops[resolvedStops.length - 1];
+		return Math.abs(a.lat - b.lat) < 1e-6 && Math.abs(a.lon - b.lon) < 1e-6;
+	}
+
 	function markerIcon(index: number, isPause: boolean, isStart: boolean, isEnd: boolean) {
 		const L = leafletLib!;
+		// Start=Ziel am selben Ort: eine kombinierte Blase mit beiden Fahnen, ohne Nummer
+		if (isStart && isEnd && startEqualsGoal()) {
+			const size = 52;
+			const html =
+				'<div class="stop-marker combined" style="width:' + size + 'px;height:' + size + 'px">' +
+				'<span class="half start"></span><span class="half end"></span>' +
+				'<span class="marker-flag start" title="Start">⚑</span>' +
+				'<span class="marker-flag end" title="Ziel">⚑</span>' +
+				'</div>';
+			return L.divIcon({
+				className: 'stop-marker-wrapper',
+				html,
+				iconSize: [size, size],
+				iconAnchor: [size / 2, size / 2]
+			});
+		}
 		const big = isPause || isStart || isEnd;
 		const size = big ? 40 : 30;
 		const cls = isStart ? ' stop-marker-start' : isEnd ? ' stop-marker-end' : isPause ? ' stop-marker-pause' : '';
 		const badges =
-			(isStart ? '<span class="marker-corner start">S</span>' : '') +
-			(isEnd ? '<span class="marker-corner end">Z</span>' : '') +
+			(isStart ? '<span class="marker-flag start" title="Start">⚑</span>' : '') +
+			(isEnd ? '<span class="marker-flag end" title="Ziel">⚑</span>' : '') +
 			(isPause ? '<span class="pause-badge" title="Pause">⏸</span>' : '');
 		return L.divIcon({
 			className: 'stop-marker-wrapper',
@@ -261,10 +289,18 @@ let casingLine: L.Polyline | undefined;
 			const L = leafletLib!;
 			casingLine = L.polyline(coords, { color: '#0f172a', weight: 9, opacity: 0.9 }).addTo(group!);
 			routeLine = L.polyline(coords, { color: '#fbbf24', weight: 5, opacity: 1 }).addTo(group!);
+			const sameStartGoal =
+				found.length >= 2 &&
+				Math.abs(found[0].lat - found[found.length - 1].lat) < 1e-6 &&
+				Math.abs(found[0].lon - found[found.length - 1].lon) < 1e-6;
 			found.forEach((s, i) => {
-				const icon = markerIcon(i, s.pause, i === 0, i === found.length - 1);
+				const isEnd = i === found.length - 1;
+				if (sameStartGoal && isEnd) return; // kombinierte Blase am Start
+				const icon = markerIcon(i, s.pause, i === 0, isEnd);
 				const m = L.marker([s.lat, s.lon], { icon }).addTo(group!);
-				m.bindTooltip(`${i + 1}. ${s.name}${s.pause ? ' (Pause)' : ''}${i === 0 ? ' – Start' : ''}${i === found.length - 1 ? ' – Ziel' : ''}`, { direction: 'top', offset: [0, -12] });
+				const startEndLabel =
+					sameStartGoal && i === 0 ? ' – Start und Ziel' : i === 0 ? ' – Start' : isEnd ? ' – Ziel' : '';
+				m.bindTooltip(`${i + 1}. ${s.name}${s.pause ? ' (Pause)' : ''}${startEndLabel}`, { direction: 'top', offset: [0, -12] });
 				markers.push(m);
 			});
 			map?.fitBounds(casingLine.getBounds(), { padding: [80, 80] });
@@ -478,28 +514,89 @@ let casingLine: L.Polyline | undefined;
 
 	// ---------- Export-Editor: Logik ----------
 
+	let legendMeasureCtx: CanvasRenderingContext2D | null = null;
+	function legendCtx(): CanvasRenderingContext2D {
+		legendMeasureCtx ??= document.createElement('canvas').getContext('2d')!;
+		return legendMeasureCtx;
+	}
+
+	function legendTagsFor(i: number): Array<[string, string, string]> {
+		const tags: Array<[string, string, string]> = [];
+		if (i === 0) tags.push(['Start', '#22c55e', '#ffffff']);
+		if (i === resolvedStops.length - 1) tags.push(['Ziel', '#334155', '#ffffff']);
+		if (resolvedStops[i]?.pause) tags.push(['Pause', '#38bdf8', '#0f172a']);
+		return tags;
+	}
+
+	function legendTagWidth(tags: Array<[string, string, string]>): number {
+		const c = legendCtx();
+		c.font = 'bold 9.5px sans-serif';
+		let w = 0;
+		for (const [label] of tags) w += c.measureText(label).width + 10;
+		if (tags.length) w += 4 * (tags.length - 1) + 4;
+		return w;
+	}
+
+	function legendWrapLines(name: string, tagW: number, maxTextW: number): string[] {
+		const c = legendCtx();
+		c.font = '12.5px sans-serif';
+		const words = name.split(/\s+/);
+		const lines: string[] = [];
+		let cur = '';
+		for (const word of words) {
+			const test = cur ? cur + ' ' + word : word;
+			if (c.measureText(test).width > maxTextW - tagW && cur) {
+				lines.push(cur);
+				cur = word;
+			} else {
+				cur = test;
+			}
+		}
+		if (cur) lines.push(cur);
+		return lines;
+	}
+
+	function legendRowHeight(lines: number): number {
+		return Math.max(22, lines * 16);
+	}
+
+	/**
+	 * Verteilt die Stopps auf Spalten: ab ca. 230 px Breite pro Spalte wird
+	 * der Listeninhalt mehrspaltig (ausbalanciert nach Zeilensumme).
+	 */
+	function legendColumns(width: number) {
+		if (!browser || !resolvedStops.length) return { cols: [] as Array<Array<{ s: (typeof resolvedStops)[number]; i: number; tags: Array<[string, string, string]>; lines: string[] }>>, colW: width };
+		const nCols = Math.max(1, Math.min(3, Math.floor(width / 230)));
+		const colW = width / nCols;
+		const maxTextW = colW - 24 - 26;
+		const entries = resolvedStops.map((s, i) => {
+			const tags = legendTagsFor(i);
+			const tagW = legendTagWidth(tags);
+			return { s, i, tags, lines: legendWrapLines(s.name, tagW, maxTextW) };
+		});
+		const rowH = (e: { lines: string[] }) => legendRowHeight(e.lines.length) + 6;
+		const total = entries.reduce((sum, e) => sum + rowH(e), 0);
+		const target = total / nCols;
+		const cols: Array<typeof entries> = [[]];
+		let h = 0;
+		for (const e of entries) {
+			if (cols.length < nCols && h + rowH(e) / 2 > target) {
+				cols.push([]);
+				h = 0;
+			}
+			cols[cols.length - 1].push(e);
+			h += rowH(e);
+		}
+		return { cols, colW };
+	}
+
 	function defaultLegendHeight(w: number): number {
 		if (!resolvedStops.length) return 100;
-		const c = document.createElement('canvas').getContext('2d')!;
-		c.font = '12.5px sans-serif';
-		const maxTextW = w - 12 * 2 - 26;
-		let total = 30;
-		for (const s of resolvedStops) {
-			const words = s.name.split(/\s+/);
-			let lines = 1;
-			let cur = '';
-			for (const word of words) {
-				const test = cur ? cur + ' ' + word : word;
-				if (c.measureText(test).width > maxTextW && cur) {
-					lines++;
-					cur = word;
-				} else {
-					cur = test;
-				}
-			}
-			total += lines * 16 + 6;
-		}
-		return total + 6;
+		const { cols } = legendColumns(w);
+		const heights = cols.map((col) =>
+			col.reduce((sum, e) => sum + legendRowHeight(e.lines.length) + 6, 0)
+		);
+		return 30 + Math.max(...heights, 22) + 6;
 	}
 
 	function resetExportLayout() {
@@ -611,7 +708,7 @@ let casingLine: L.Polyline | undefined;
 			}
 		} else if (dragKind === 'resize') {
 			if (dragTarget === 'legend') {
-				exportLayout.legendW = Math.round(Math.max(160, Math.min(480, base.w + dx)));
+				exportLayout.legendW = Math.round(Math.max(160, Math.min(700, base.w + dx)));
 			} else if (dragTarget === 'logo') {
 				exportLayout.logoW = Math.round(Math.max(50, Math.min(320, base.w + dx)));
 			}
@@ -732,11 +829,13 @@ let casingLine: L.Polyline | undefined;
 			drawLine(5, '#fbbf24');
 		}
 
-		// 3) Marker
+		// 3) Marker (Start=Ziel am selben Ort -> eine kombinierte Blase statt zwei)
+		const combinedStartGoal = startEqualsGoal();
 		resolvedStops.forEach((s, i) => {
-			const p = map!.latLngToContainerPoint([s.lat, s.lon]);
 			const isStart = i === 0;
 			const isEnd = i === resolvedStops.length - 1;
+			if (combinedStartGoal && (isStart || isEnd)) return; // wird gemeinsam gezeichnet
+			const p = map!.latLngToContainerPoint([s.lat, s.lon]);
 			const big = s.pause || isStart || isEnd;
 			const r = big ? 19 : 14;
 			ctx.beginPath();
@@ -754,18 +853,42 @@ let casingLine: L.Polyline | undefined;
 			ctx.textAlign = 'left';
 			ctx.textBaseline = 'alphabetic';
 			if (isStart || isEnd) {
-				ctx.beginPath();
-				ctx.arc(p.x + 18, p.y - 17, 13, 0, Math.PI * 2);
-				ctx.fillStyle = isStart ? '#22c55e' : '#0f172a';
-				ctx.fill();
-				ctx.lineWidth = 2.5;
-				ctx.strokeStyle = '#ffffff';
-				ctx.stroke();
-				ctx.fillStyle = '#ffffff';
-				ctx.font = 'bold 14px sans-serif';
-				ctx.textAlign = 'center';
-				ctx.fillText(isStart ? 'S' : 'Z', p.x + 18, p.y - 12);
-				ctx.textAlign = 'left';
+				// Fahnen-Badges wie in der Vorschau; bei Start=Ziel nur ein kombiniertes Badge
+				const flagAt = (fx: number, startFlag: boolean, combinedFlag: boolean) => {
+					const w = combinedFlag ? 26 : 22;
+					const h = combinedFlag ? 26 : 22;
+					const x = fx - w / 2;
+					const y = p.y - 17 - h / 2 + 4;
+					// Fadenkreuz-Form: runde Ecken oben, Spitze unten links (wie .marker-flag)
+					ctx.beginPath();
+					ctx.moveTo(x + w, y);
+					ctx.lineTo(x + w, y + h * 0.75);
+					ctx.lineTo(x + w * 0.35, y + h * 0.75);
+					ctx.lineTo(x, y + h);
+					ctx.lineTo(x, y);
+					ctx.closePath();
+					if (combinedFlag) {
+						ctx.save();
+						ctx.clip();
+						ctx.fillStyle = '#22c55e';
+						ctx.fillRect(x, y, w / 2, h);
+						ctx.fillStyle = '#0f172a';
+						ctx.fillRect(x + w / 2, y, w / 2, h);
+						ctx.restore();
+					} else {
+						ctx.fillStyle = startFlag ? '#22c55e' : '#0f172a';
+						ctx.fill();
+					}
+					ctx.lineWidth = 2;
+					ctx.strokeStyle = '#ffffff';
+					ctx.stroke();
+				};
+				if (isStart && isEnd && startEqualsGoal()) {
+					flagAt(p.x + 20, true, true);
+				} else {
+					if (isStart) flagAt(p.x - 16, true, false);
+					if (isEnd) flagAt(p.x + 20, false, false);
+				}
 			}
 			if (s.pause) {
 				ctx.beginPath();
@@ -780,6 +903,49 @@ let casingLine: L.Polyline | undefined;
 				ctx.fillRect(p.x + 18 + 1, p.y + 18 - 5 + 0, 2.5, 10);
 			}
 		});
+
+		// 3b) Kombinierte Start/Ziel-Blase am selben Ort (beide Fahnen, keine Nummer)
+		if (combinedStartGoal) {
+			const s0 = resolvedStops[0];
+			const p = map!.latLngToContainerPoint([s0.lat, s0.lon]);
+			const r = 24;
+			ctx.beginPath();
+			ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+			ctx.save();
+			ctx.clip();
+			ctx.fillStyle = '#22c55e';
+			ctx.fillRect(p.x - r, p.y - r, r, r * 2);
+			ctx.fillStyle = '#0f172a';
+			ctx.fillRect(p.x, p.y - r, r, r * 2);
+			ctx.restore();
+			ctx.lineWidth = 3.5;
+			ctx.strokeStyle = '#ffffff';
+			ctx.stroke();
+			ctx.lineWidth = 1.5;
+			ctx.strokeStyle = '#0f172a';
+			ctx.stroke();
+			// Beide Fahnen oben mittig nebeneinander
+			const flagAt = (fx: number, startFlag: boolean) => {
+				const w = 22;
+				const h = 22;
+				const x = fx - w / 2;
+				const y = p.y - r - h + 6;
+				ctx.beginPath();
+				ctx.moveTo(x + w, y);
+				ctx.lineTo(x + w, y + h * 0.75);
+				ctx.lineTo(x + w * 0.35, y + h * 0.75);
+				ctx.lineTo(x, y + h);
+				ctx.lineTo(x, y);
+				ctx.closePath();
+				ctx.fillStyle = startFlag ? '#22c55e' : '#0f172a';
+				ctx.fill();
+				ctx.lineWidth = 2;
+				ctx.strokeStyle = '#ffffff';
+				ctx.stroke();
+			};
+			flagAt(p.x - 13, true);
+			flagAt(p.x + 13, false);
+		}
 
 		// 4) Overlay: Titelbox (Position aus dem Export-Editor)
 		ctx.textAlign = 'left';
@@ -827,48 +993,19 @@ let casingLine: L.Polyline | undefined;
 			}
 		}
 
-		// 6) Overlay: Stoppliste (Position/Breite aus dem Export-Editor)
+		// 6) Overlay: Stoppliste (Position/Breite aus dem Export-Editor; breit = mehrspaltig)
 		if (resolvedStops.length) {
-			const listPad = 12;
 			const headH = 30;
 			const lineH = 16;
+			const listPad = 12;
 			const boxW = exportLayout.legendW;
-			const maxTextW = boxW - listPad * 2 - 26;
+			const { cols } = legendColumns(boxW);
+			const colW = boxW / Math.max(1, cols.length);
 
-			ctx.font = '12.5px sans-serif';
-			const rowsFor = (name: string, tagW: number): string[] => {
-				const words = name.split(/\s+/);
-				const lines: string[] = [];
-				let cur = '';
-				for (const word of words) {
-					const test = cur ? cur + ' ' + word : word;
-					if (ctx.measureText(test).width > maxTextW - tagW && cur) {
-						lines.push(cur);
-						cur = word;
-					} else {
-						cur = test;
-					}
-				}
-				if (cur) lines.push(cur);
-				return lines;
-			};
-
-			const entries = resolvedStops.map((s, i) => {
-				const isStart = i === 0;
-				const isEnd = i === resolvedStops.length - 1;
-				let tagW = 0;
-				const tags: Array<[string, string, string]> = [];
-				if (isStart) tags.push(['Start', '#22c55e', '#ffffff']);
-				if (isEnd) tags.push(['Ziel', '#334155', '#ffffff']);
-				if (s.pause) tags.push(['Pause', '#38bdf8', '#0f172a']);
-				ctx.font = 'bold 9.5px sans-serif';
-				for (const [label] of tags) tagW += ctx.measureText(label).width + 10;
-				if (tags.length) tagW += 4 * (tags.length - 1) + 4;
-				const lines = rowsFor(s.name, tagW);
-				return { s, i, tags, lines };
-			});
-
-			const boxH = headH + entries.reduce((sum, e) => sum + e.lines.length * lineH + 6, 0) + 6;
+			const colHeights = cols.map((col) =>
+				col.reduce((sum, e) => sum + legendRowHeight(e.lines.length) + 6, 0)
+			);
+			const boxH = headH + Math.max(...colHeights, 22) + 6;
 			const boxX = Math.max(4, Math.min(exportLayout.legendX, cssW - boxW - 4));
 			const boxY = Math.max(4, Math.min(exportLayout.legendY, cssH - boxH - 4));
 
@@ -880,46 +1017,50 @@ let casingLine: L.Polyline | undefined;
 			ctx.fillStyle = '#ffffff';
 			ctx.fillText('ETAPPEN / STOPPS', boxX + listPad + 2, boxY + 21);
 
-			let yy = boxY + headH + 4;
 			ctx.textAlign = 'left';
-			for (const e of entries) {
-				const cy = yy + 12 - 4;
-				const isStart = e.i === 0;
-				const isEnd = e.i === resolvedStops.length - 1;
-				ctx.beginPath();
-				ctx.arc(boxX + listPad + 10, cy, 10, 0, Math.PI * 2);
-				ctx.fillStyle = isStart ? '#22c55e' : isEnd ? '#0f172a' : e.s.pause ? '#38bdf8' : '#fbbf24';
-				ctx.fill();
-				ctx.lineWidth = 2;
-				ctx.strokeStyle = e.s.pause || isEnd ? '#0f172a' : '#ffffff';
-				ctx.stroke();
-				ctx.fillStyle = isStart || isEnd ? '#ffffff' : '#0f172a';
-				ctx.font = 'bold 11px sans-serif';
-				ctx.textAlign = 'center';
-				ctx.textBaseline = 'middle';
-				ctx.fillText(String(e.i + 1), boxX + listPad + 10, cy + 0.5);
-				ctx.textAlign = 'left';
-				ctx.textBaseline = 'alphabetic';
-
-				ctx.font = '12.5px sans-serif';
-				ctx.fillStyle = '#ffffff';
-				e.lines.forEach((line, li) => {
-					ctx.fillText(line, boxX + listPad + 26, yy + 12 + li * lineH);
-				});
-
-				let tx = boxX + boxW - listPad;
-				ctx.font = 'bold 9.5px sans-serif';
-				for (const [label, bg, fg] of [...e.tags].reverse()) {
-					const tw = ctx.measureText(label).width + 10;
-					tx -= tw;
-					roundRectPath(ctx, tx, yy + 12 - 10.5, tw, 13, 4);
-					ctx.fillStyle = bg;
+			for (let ci = 0; ci < cols.length; ci++) {
+				const colX = boxX + ci * colW;
+				let yy = boxY + headH;
+				for (const e of cols[ci]) {
+					const rowH = legendRowHeight(e.lines.length);
+					const cy = yy + 12;
+					const isStart = e.i === 0;
+					const isEnd = e.i === resolvedStops.length - 1;
+					ctx.beginPath();
+					ctx.arc(colX + listPad + 10, cy, 10, 0, Math.PI * 2);
+					ctx.fillStyle = isStart ? '#22c55e' : isEnd ? '#0f172a' : e.s.pause ? '#38bdf8' : '#fbbf24';
 					ctx.fill();
-					ctx.fillStyle = fg;
-					ctx.fillText(label, tx + 5, yy + 12 - 1);
-					tx -= 4;
+					ctx.lineWidth = 2;
+					ctx.strokeStyle = e.s.pause || isEnd ? '#0f172a' : '#ffffff';
+					ctx.stroke();
+					ctx.fillStyle = isStart || isEnd ? '#ffffff' : '#0f172a';
+					ctx.font = 'bold 11px sans-serif';
+					ctx.textAlign = 'center';
+					ctx.textBaseline = 'middle';
+					ctx.fillText(String(e.i + 1), colX + listPad + 10, cy + 0.5);
+					ctx.textAlign = 'left';
+					ctx.textBaseline = 'alphabetic';
+
+					ctx.font = '12.5px sans-serif';
+					ctx.fillStyle = '#ffffff';
+					e.lines.forEach((line, li) => {
+						ctx.fillText(line, colX + listPad + 26, yy + 12 + li * lineH);
+					});
+
+					let tx = colX + colW - listPad;
+					ctx.font = 'bold 9.5px sans-serif';
+					for (const [label, bg, fg] of [...e.tags].reverse()) {
+						const tw = ctx.measureText(label).width + 10;
+						tx -= tw;
+						roundRectPath(ctx, tx, yy + 1.5, tw, 13, 4);
+						ctx.fillStyle = bg;
+						ctx.fill();
+						ctx.fillStyle = fg;
+						ctx.fillText(label, tx + 5, yy + 11);
+						tx -= 4;
+					}
+					yy += rowH + 6;
 				}
-				yy += e.lines.length * lineH + 6;
 			}
 		}
 
@@ -1337,28 +1478,32 @@ async function savePng() {
 						onpointercancel={endOverlayDrag}
 					>
 						<p class="px-3.5 pt-1.5 pb-1 text-[13px] font-bold tracking-wide text-white uppercase">Etappen / Stopps</p>
-						<div class="px-3 pb-1.5">
-							{#each resolvedStops as s, i (i)}
-								<div class="mb-1.5 flex items-start gap-1.5">
-									<span
-										class="mt-0.5 inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[11px] font-bold {i === 0
-											? 'bg-green-500 text-white'
-											: i === resolvedStops.length - 1
-												? 'bg-slate-900 text-white ring-2 ring-white'
-												: s.pause
-													? 'bg-sky-400 text-slate-900'
-													: 'bg-amber-400 text-slate-900'}">{i + 1}</span
-									>
-									<p class="min-w-0 flex-1 text-[12.5px] leading-4 text-white">
-										{#if i === 0 || i === resolvedStops.length - 1 || s.pause}
-											<span class="float-right ml-1 inline-flex gap-1">
-												{#if i === 0}<span class="rounded bg-green-500 px-1.5 py-px text-[9.5px] font-bold text-white">Start</span>{/if}
-												{#if i === resolvedStops.length - 1}<span class="rounded bg-slate-700 px-1.5 py-px text-[9.5px] font-bold text-white">Ziel</span>{/if}
-												{#if s.pause}<span class="rounded bg-sky-400 px-1.5 py-px text-[9.5px] font-bold text-slate-900">Pause</span>{/if}
-											</span>
-										{/if}
-										{s.name}
-									</p>
+						<div class="flex pb-1.5">
+							{#each legendCols as col, ci (ci)}
+								<div class="min-w-0 flex-1 px-3">
+									{#each col as item (item.i)}
+										<div class="mb-1.5 flex items-start gap-1.5">
+											<span
+												class="mt-0.5 inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[11px] font-bold {item.i === 0
+													? 'bg-green-500 text-white'
+													: item.i === resolvedStops.length - 1
+														? 'bg-slate-900 text-white ring-2 ring-white'
+														: item.s.pause
+															? 'bg-sky-400 text-slate-900'
+															: 'bg-amber-400 text-slate-900'}">{item.i + 1}</span
+											>
+											<p class="min-w-0 flex-1 text-[12.5px] leading-4 text-white">
+												{#if item.i === 0 || item.i === resolvedStops.length - 1 || item.s.pause}
+													<span class="float-right ml-1 inline-flex gap-1">
+														{#if item.i === 0}<span class="rounded bg-green-500 px-1.5 py-px text-[9.5px] font-bold text-white">Start</span>{/if}
+														{#if item.i === resolvedStops.length - 1}<span class="rounded bg-slate-700 px-1.5 py-px text-[9.5px] font-bold text-white">Ziel</span>{/if}
+														{#if item.s.pause}<span class="rounded bg-sky-400 px-1.5 py-px text-[9.5px] font-bold text-slate-900">Pause</span>{/if}
+													</span>
+												{/if}
+												{item.s.name}
+											</p>
+										</div>
+									{/each}
 								</div>
 							{/each}
 						</div>
@@ -1427,27 +1572,72 @@ async function savePng() {
 		background: #0f172a;
 		color: #ffffff;
 	}
-	:global(.marker-corner) {
+	:global(.marker-flag) {
 		position: absolute;
-		top: -11px;
-		right: -11px;
+		top: -14px;
+		right: -10px;
 		width: 22px;
 		height: 22px;
-		border-radius: 50%;
-		border: 2.5px solid #ffffff;
+		border-radius: 50% 50% 50% 4px;
+		border: 2px solid #ffffff;
 		color: #ffffff;
-		font-size: 12px;
-		font-weight: 700;
+		font-size: 13px;
+		line-height: 1;
 		display: flex;
 		align-items: center;
 		justify-content: center;
 		box-shadow: 0 1px 4px rgba(0, 0, 0, 0.6);
+		overflow: hidden;
 	}
-	:global(.marker-corner.start) {
+	:global(.marker-flag.start) {
 		background: #22c55e;
 	}
-	:global(.marker-corner.end) {
+	:global(.marker-flag.end) {
 		background: #0f172a;
+		top: -14px;
+		right: 8px;
+	}
+	:global(.marker-flag.combined) {
+		background: linear-gradient(135deg, #22c55e 50%, #0f172a 50%);
+		width: 26px;
+		height: 26px;
+		top: -16px;
+		right: -12px;
+		font-size: 14px;
+	}
+	/* Kombinierte Start/Ziel-Blase: halb grün, halb dunkel, beide Fahnen oben */
+	:global(.stop-marker.combined) {
+		background: transparent;
+		border: none;
+		box-shadow: none;
+		overflow: visible;
+	}
+	:global(.stop-marker.combined .half) {
+		position: absolute;
+		top: 6px;
+		left: 6px;
+		width: 40px;
+		height: 40px;
+		border-radius: 50%;
+		box-shadow: 0 1px 4px rgba(0, 0, 0, 0.6);
+	}
+	:global(.stop-marker.combined .half.start) {
+		background: #22c55e;
+		clip-path: inset(0 50% 0 0);
+		border-left: 3px solid #0f172a;
+	}
+	:global(.stop-marker.combined .half.end) {
+		background: #0f172a;
+		clip-path: inset(0 0 0 50%);
+	}
+	:global(.stop-marker.combined .marker-flag) {
+		top: -6px;
+	}
+	:global(.stop-marker.combined .marker-flag.start) {
+		right: 28px;
+	}
+	:global(.stop-marker.combined .marker-flag.end) {
+		right: 2px;
 	}
 	:global(.pause-badge) {
 		position: absolute;
