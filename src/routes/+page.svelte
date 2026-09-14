@@ -108,7 +108,41 @@ let casingLine: L.Polyline | undefined;
 
 	let printing = $state(false);
 	let printImage = $state('');
-	let saveOpen = $state(false);
+
+	// ---------- Export-Editor (A4-Vorschau mit frei positionierbaren Elementen) ----------
+	const A4_W = 794;
+	const A4_H = 1123;
+	interface ExportLayout {
+		titleX: number;
+		titleY: number;
+		logoX: number;
+		logoY: number;
+		logoW: number;
+		legendX: number;
+		legendY: number;
+		legendW: number;
+	}
+	let exportOpen = $state(false);
+	let exportBusy = $state(false);
+	let exportLayout = $state<ExportLayout>({
+		titleX: 16,
+		titleY: 16,
+		logoX: A4_W - 16 - 110,
+		logoY: 16,
+		logoW: 110,
+		legendX: A4_W - 16 - 240,
+		legendY: A4_H - 16 - 320,
+		legendW: 240
+	});
+	let exportLayoutTouched = false;
+	let frameHost: HTMLDivElement | undefined = $state();
+	let frameInner: HTMLDivElement | undefined = $state();
+	let frameScale = $state(1);
+	let mapHome: HTMLElement | null = null;
+	let prevExportView: { center: L.LatLng; zoom: number } | null = null;
+	let dragTarget = $state<'title' | 'logo' | 'legend' | null>(null);
+	let dragKind: 'move' | 'resize' | null = null;
+	let dragStart = { x: 0, y: 0, base: { x: 0, y: 0, w: 0 } };
 
 	onMount(() => {
 		import('leaflet').then(({ default: L }) => {
@@ -442,6 +476,154 @@ let casingLine: L.Polyline | undefined;
 		return { w, h };
 	}
 
+	// ---------- Export-Editor: Logik ----------
+
+	function defaultLegendHeight(w: number): number {
+		if (!resolvedStops.length) return 100;
+		const c = document.createElement('canvas').getContext('2d')!;
+		c.font = '12.5px sans-serif';
+		const maxTextW = w - 12 * 2 - 26;
+		let total = 30;
+		for (const s of resolvedStops) {
+			const words = s.name.split(/\s+/);
+			let lines = 1;
+			let cur = '';
+			for (const word of words) {
+				const test = cur ? cur + ' ' + word : word;
+				if (c.measureText(test).width > maxTextW && cur) {
+					lines++;
+					cur = word;
+				} else {
+					cur = test;
+				}
+			}
+			total += lines * 16 + 6;
+		}
+		return total + 6;
+	}
+
+	function resetExportLayout() {
+		const legendW = 240;
+		exportLayout = {
+			titleX: 16,
+			titleY: 16,
+			logoX: A4_W - 16 - 110,
+			logoY: 16,
+			logoW: 110,
+			legendX: A4_W - 16 - legendW,
+			legendY: A4_H - 16 - defaultLegendHeight(legendW),
+			legendW
+		};
+	}
+
+	$effect(() => {
+		if (exportOpen) void afterExportOpen();
+	});
+
+	function openExport() {
+		if (resolvedStops.length < 2) {
+			errorMessage = 'Bitte zuerst eine Route berechnen.';
+			return;
+		}
+		if (!exportLayoutTouched) resetExportLayout();
+		prevExportView = map ? { center: map.getCenter(), zoom: map.getZoom() } : null;
+		mapHome = mapEl?.parentElement ?? null;
+		exportOpen = true;
+	}
+
+	async function afterExportOpen() {
+		await tick();
+		if (!frameHost || !mapEl || !map) return;
+		mapHome = mapEl.parentElement ?? mapHome;
+		frameHost.appendChild(mapEl);
+		map.invalidateSize();
+		fitRouteInFrame();
+		updateFrameScale();
+	}
+
+	function fitRouteInFrame() {
+		if (!map || !leafletLib || currentRouteCoords.length < 2) return;
+		map.fitBounds(leafletLib.latLngBounds(currentRouteCoords), {
+			paddingTopLeft: [24, 110],
+			paddingBottomRight: [280, 24]
+		});
+	}
+
+	function updateFrameScale() {
+		if (!frameInner) return;
+		const stage = frameInner.parentElement?.parentElement;
+		const availW = (stage?.clientWidth ?? window.innerWidth) - 32;
+		const availH = (stage?.clientHeight ?? window.innerHeight) - 32;
+		frameScale = Math.max(0.2, Math.min(1, availW / A4_W, availH / A4_H));
+	}
+
+	function closeExport() {
+		exportOpen = false;
+		if (mapHome && mapEl) {
+			mapHome.appendChild(mapEl);
+			map?.invalidateSize();
+			if (prevExportView) map?.setView(prevExportView.center, prevExportView.zoom);
+		}
+	}
+
+	function startOverlayDrag(
+		e: PointerEvent,
+		kind: 'title' | 'logo' | 'legend',
+		mode: 'move' | 'resize'
+	) {
+		e.preventDefault();
+		e.stopPropagation();
+		const rect = frameInner?.getBoundingClientRect();
+		if (!rect) return;
+		const scale = rect.width / A4_W;
+		const base =
+			kind === 'title'
+				? { x: exportLayout.titleX, y: exportLayout.titleY, w: 0 }
+				: kind === 'logo'
+					? { x: exportLayout.logoX, y: exportLayout.logoY, w: exportLayout.logoW }
+					: { x: exportLayout.legendX, y: exportLayout.legendY, w: exportLayout.legendW };
+		dragTarget = kind;
+		dragKind = mode;
+		dragStart = { x: e.clientX / scale, y: e.clientY / scale, base };
+		(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+	}
+
+	function onOverlayDrag(e: PointerEvent) {
+		if (!dragTarget || !dragKind) return;
+		const rect = frameInner?.getBoundingClientRect();
+		if (!rect) return;
+		const scale = rect.width / A4_W;
+		const dx = e.clientX / scale - dragStart.x;
+		const dy = e.clientY / scale - dragStart.y;
+		const base = dragStart.base;
+		if (dragKind === 'move') {
+			const x = Math.max(0, Math.min(A4_W - 40, base.x + dx));
+			const y = Math.max(0, Math.min(A4_H - 30, base.y + dy));
+			if (dragTarget === 'title') {
+				exportLayout.titleX = Math.round(x);
+				exportLayout.titleY = Math.round(y);
+			} else if (dragTarget === 'logo') {
+				exportLayout.logoX = Math.round(x);
+				exportLayout.logoY = Math.round(y);
+			} else {
+				exportLayout.legendX = Math.round(x);
+				exportLayout.legendY = Math.round(y);
+			}
+		} else if (dragKind === 'resize') {
+			if (dragTarget === 'legend') {
+				exportLayout.legendW = Math.round(Math.max(160, Math.min(480, base.w + dx)));
+			} else if (dragTarget === 'logo') {
+				exportLayout.logoW = Math.round(Math.max(50, Math.min(320, base.w + dx)));
+			}
+		}
+		exportLayoutTouched = true;
+	}
+
+	function endOverlayDrag() {
+		dragTarget = null;
+		dragKind = null;
+	}
+
 	/**
 	 * Erzeugt das Export-Bild: Karte im A4-Hochformat-Seitenverhältnis,
 	 * die den vollen Bereich füllt. Titel, Logo und Stoppliste werden als
@@ -460,49 +642,39 @@ let casingLine: L.Polyline | undefined;
 		const prevCenter = map.getCenter();
 		const prevZoom = map.getZoom();
 		const prevStyle = mapEl.getAttribute('style') ?? '';
-		mapEl.style.position = 'fixed';
-		mapEl.style.left = '0';
-		mapEl.style.top = '0';
-		mapEl.style.width = `${cssW}px`;
-		mapEl.style.height = `${cssH}px`;
-		mapEl.style.zIndex = '-1';
-		mapEl.style.inset = 'auto';
+		let frameTransform = '';
+		if (!exportOpen) {
+			mapEl.style.position = 'fixed';
+			mapEl.style.left = '0';
+			mapEl.style.top = '0';
+			mapEl.style.width = `${cssW}px`;
+			mapEl.style.height = `${cssH}px`;
+			mapEl.style.zIndex = '-1';
+			mapEl.style.inset = 'auto';
+		} else {
+			// Dialog-Skalierung für die Aufnahme neutralisieren
+			frameTransform = frameInner?.style.transform ?? '';
+			if (frameInner) frameInner.style.transform = 'none';
+		}
 		map.invalidateSize();
 
-		// Ausrichtung bestimmen: Ist die Route höher als breit? Dann kommt die
-		// Stoppliste rechts in eine einspaltige Liste und die Route wird links
-		// ausgerichtet. Sonst bleibt das bisherige Layout (Liste unten rechts).
-		let bbox: { w: number; h: number } | null = null;
-		if (currentRouteCoords.length > 1) {
-			const b = L.latLngBounds(currentRouteCoords);
-			bbox = { w: b.getEast() - b.getWest(), h: b.getNorth() - b.getSouth() };
-		}
-		// Breitengrad-Korrektur: Bei gleichen Meter-Distanzen sind Breitengrade
-		// "wertvoller", daher mit cos(Breite) in Längengrad-Einheiten umrechnen.
-		const routeIsTall =
-			bbox !== null && bbox.h / Math.max(bbox.w, 1e-9) > 0.85;
-
-		if (currentRouteCoords.length > 1) {
-			// Overlays einrechnen: Titelbox oben links, Logo oben rechts.
-			// Hohe Route: Route links, Stoppliste einspaltig rechts unten.
-			// Breite Route: Stoppliste unten rechts wie bisher.
+		// Im Export-Editor ist die Ansicht bewusst gewählt -> nicht neu einpassen
+		if (!exportOpen && currentRouteCoords.length > 1) {
+			const stopsBox = computeStopsBoxLayout();
 			const titleTop = 16 + 70 + 16; // Titelbox unten
-			const padTopLeft: [number, number] = routeIsTall
-				? [24, Math.max(titleTop, 60)]
-				: [Math.round(computeStopsBoxLayout().w * 0.45), Math.max(titleTop, 90)];
-			const padBotRight: [number, number] = routeIsTall
-				? [computeStopsBoxLayoutTall().w + 24, 24]
-				: [
-						Math.round(computeStopsBoxLayout().w * 0.6),
-						Math.round(computeStopsBoxLayout().h * 0.75)
-					];
+			const padTopLeft: [number, number] = [60, Math.max(titleTop, 90)];
+			const padBotRight: [number, number] = [
+				Math.round(stopsBox.w * 0.6),
+				Math.round(computeStopsBoxLayoutTall().h * 0.75)
+			];
 			map.fitBounds(L.latLngBounds(currentRouteCoords), {
 				paddingTopLeft: padTopLeft,
 				paddingBottomRight: padBotRight
 			});
 		}
 
-		// Auf geladene Kacheln warten (max. 5 s)
+		// Auf geladene Kacheln warten (max. 5 s; im Editor kürzer, da schon sichtbar)
+		const tileTimeout = exportOpen ? 800 : 5000;
 		await new Promise<void>((resolve) => {
 			let done = false;
 			const finish = () => {
@@ -518,7 +690,7 @@ let casingLine: L.Polyline | undefined;
 				layer.once('load', finish);
 			}
 			if (pending === 0) finish();
-			else setTimeout(finish, 5000);
+			else setTimeout(finish, tileTimeout);
 		});
 		await new Promise((r) => setTimeout(r, 350));
 
@@ -609,7 +781,7 @@ let casingLine: L.Polyline | undefined;
 			}
 		});
 
-		// 4) Overlay: Titelbox oben links
+		// 4) Overlay: Titelbox (Position aus dem Export-Editor)
 		ctx.textAlign = 'left';
 		ctx.textBaseline = 'alphabetic';
 		if (title.trim()) {
@@ -622,212 +794,68 @@ let casingLine: L.Polyline | undefined;
 			ctx.font = '13px sans-serif';
 			const boxW = (sub ? Math.max(titleW, ctx.measureText(sub).width) : titleW) + 30;
 			const boxH = sub ? 70 : 42;
-			roundRectPath(ctx, 16, 16, boxW, boxH, 12);
+			const tx = Math.min(exportLayout.titleX, cssW - boxW - 4);
+			const ty = Math.min(exportLayout.titleY, cssH - boxH - 4);
+			roundRectPath(ctx, tx, ty, boxW, boxH, 12);
 			ctx.fillStyle = 'rgba(15, 23, 42, 0.88)';
 			ctx.fill();
 			ctx.fillStyle = '#ffffff';
 			ctx.font = 'bold 24px sans-serif';
-			ctx.fillText(title.trim(), 30, 16 + (sub ? 33 : 28));
+			ctx.fillText(title.trim(), tx + 14, ty + (sub ? 33 : 28));
 			if (sub) {
 				ctx.fillStyle = '#cbd5e1';
 				ctx.font = '13px sans-serif';
-				ctx.fillText(sub, 30, 16 + 56);
+				ctx.fillText(sub, tx + 14, ty + 56);
 			}
 		}
 
-		// 5) Overlay: Logo oben rechts
+		// 5) Overlay: Logo (Position/Groesse aus dem Export-Editor)
 		if (showLogo) {
 			try {
 				const logo = await loadLogoImage();
 				if (logo) {
-					const w = 110;
+					const w = exportLayout.logoW;
 					const h = w * (logo.height / logo.width);
 					ctx.save();
 					ctx.shadowColor = 'rgba(0,0,0,0.5)';
 					ctx.shadowBlur = 12;
-					ctx.drawImage(logo, cssW - 16 - w, 16, w, h);
+					ctx.drawImage(logo, exportLayout.logoX, exportLayout.logoY, w, h);
 					ctx.restore();
 				}
 			} catch {
-				/* Logo überspringen */
+				/* Logo ueberspringen */
 			}
 		}
 
-		// 6) Overlay: Stoppliste
-		//    - Hohe Route: einspaltige Liste rechts über die volle Höhe
-		//    - Breite Route: Liste unten rechts (ggf. zweispaltig), wie bisher
+		// 6) Overlay: Stoppliste (Position/Breite aus dem Export-Editor)
 		if (resolvedStops.length) {
-			const rowH = 23;
-			const pad = 14;
+			const listPad = 12;
 			const headH = 30;
-			let boxX: number;
-			let boxY: number;
-			let boxW: number;
-			let boxH: number;
-			let positions: Array<{ x: number; y: number }> = [];
+			const lineH = 16;
+			const boxW = exportLayout.legendW;
+			const maxTextW = boxW - listPad * 2 - 26;
 
-			if (routeIsTall) {
-				const listW = 230;
-				const listPad = 12;
-				const maxTextW = listW - listPad * 2 - 26;
-
-				// Zeilen mit Umbruch messen: Jeder Stopp kann mehrzeilig sein
-				ctx.font = '12.5px sans-serif';
-				const rowsFor = (name: string, tagW: number): string[] => {
-					const words = name.split(/\s+/);
-					const lines: string[] = [];
-					let cur = '';
-					for (const word of words) {
-						const test = cur ? cur + ' ' + word : word;
-						if (ctx.measureText(test).width > maxTextW - tagW && cur) {
-							lines.push(cur);
-							cur = word;
-						} else {
-							cur = test;
-						}
-					}
-					if (cur) lines.push(cur);
-					return lines;
-				};
-
-				const entries = resolvedStops.map((s, i) => {
-					const isStart = i === 0;
-					const isEnd = i === resolvedStops.length - 1;
-					let tagW = 0;
-					const tags: Array<[string, string, string]> = [];
-					if (isStart) tags.push(['Start', '#22c55e', '#ffffff']);
-					if (isEnd) tags.push(['Ziel', '#334155', '#ffffff']);
-					if (s.pause) tags.push(['Pause', '#38bdf8', '#0f172a']);
-					ctx.font = 'bold 9.5px sans-serif';
-					for (const [label] of tags) tagW += ctx.measureText(label).width + 10;
-					if (tags.length) tagW += 4 * (tags.length - 1) + 4;
-					const lines = rowsFor(s.name, tagW);
-					return { s, i, tags, lines };
-				});
-
-				const lineH = 16;
-				boxW = listW;
-				boxH = headH + entries.reduce((sum, e) => sum + e.lines.length * lineH + 6, 0) + 6;
-				boxX = cssW - 16 - boxW;
-				boxY = cssH - 16 - boxH;
-				let yy = boxY + headH + 4;
-				positions = entries.map((e) => {
-					const pos = { x: boxX + listPad, y: yy + 12 };
-					yy += e.lines.length * lineH + 6;
-					return pos;
-				});
-
-				roundRectPath(ctx, boxX, boxY, boxW, boxH, 12);
-				ctx.fillStyle = 'rgba(0, 0, 0, 0.74)';
-				ctx.fill();
-
-				ctx.font = 'bold 13px sans-serif';
-				ctx.fillStyle = '#ffffff';
-				ctx.fillText('ETAPPEN / STOPPS', boxX + listPad + 2, boxY + 21);
-
-				ctx.textAlign = 'left';
-				for (const e of entries) {
-					const pos = positions[e.i];
-					// Marker-Kreis auf der ersten Zeile
-					const isStart = e.i === 0;
-					const isEnd = e.i === resolvedStops.length - 1;
-					const cy = pos.y - 4;
-					ctx.beginPath();
-					ctx.arc(pos.x + 10, cy, 10, 0, Math.PI * 2);
-					ctx.fillStyle = isStart ? '#22c55e' : isEnd ? '#0f172a' : e.s.pause ? '#38bdf8' : '#fbbf24';
-					ctx.fill();
-					ctx.lineWidth = 2;
-					ctx.strokeStyle = e.s.pause || isEnd ? '#0f172a' : '#ffffff';
-					ctx.stroke();
-					ctx.fillStyle = isStart || isEnd ? '#ffffff' : '#0f172a';
-					ctx.font = 'bold 11px sans-serif';
-					ctx.textAlign = 'center';
-					ctx.textBaseline = 'middle';
-					ctx.fillText(String(e.i + 1), pos.x + 10, cy + 0.5);
-					ctx.textAlign = 'left';
-					ctx.textBaseline = 'alphabetic';
-
-					// Namenszeilen (umgebrochen)
-					ctx.font = '12.5px sans-serif';
-					ctx.fillStyle = '#ffffff';
-					e.lines.forEach((line, li) => {
-						ctx.fillText(line, pos.x + 26, pos.y + li * lineH);
-					});
-
-					// Tags rechtsbündig auf der ersten Zeile
-					let tx = boxX + boxW - listPad;
-					ctx.font = 'bold 9.5px sans-serif';
-					for (const [label, bg, fg] of [...e.tags].reverse()) {
-						const tw = ctx.measureText(label).width + 10;
-						tx -= tw;
-						roundRectPath(ctx, tx, pos.y - 10.5, tw, 13, 4);
-						ctx.fillStyle = bg;
-						ctx.fill();
-						ctx.fillStyle = fg;
-						ctx.fillText(label, tx + 5, pos.y - 1);
-						tx -= 4;
+			ctx.font = '12.5px sans-serif';
+			const rowsFor = (name: string, tagW: number): string[] => {
+				const words = name.split(/\s+/);
+				const lines: string[] = [];
+				let cur = '';
+				for (const word of words) {
+					const test = cur ? cur + ' ' + word : word;
+					if (ctx.measureText(test).width > maxTextW - tagW && cur) {
+						lines.push(cur);
+						cur = word;
+					} else {
+						cur = test;
 					}
 				}
-				ctx.textAlign = 'left';
-			} else {
-				const twoCols = resolvedStops.length > 16;
-				const rowsPerCol = twoCols ? Math.ceil(resolvedStops.length / 2) : resolvedStops.length;
-				boxH = headH + rowsPerCol * rowH + pad;
-				ctx.font = '12.5px sans-serif';
-				let nameW = 0;
-				for (const s of resolvedStops) nameW = Math.max(nameW, ctx.measureText(s.name).width);
-				const colW = Math.min(46 + nameW + 60, cssW / 2 - 40);
-				boxW = twoCols ? colW * 2 + pad : colW + pad * 2;
-				boxX = cssW - 16 - boxW;
-				boxY = cssH - 16 - boxH;
-				positions = resolvedStops.map((_, i) => {
-					const col = twoCols ? (i < rowsPerCol ? 0 : 1) : 0;
-					const row = twoCols ? i % rowsPerCol : i;
-					return { x: boxX + pad + col * (colW + 10), y: boxY + headH + row * rowH + 12 };
-				});
-			}
+				if (cur) lines.push(cur);
+				return lines;
+			};
 
-			if (!routeIsTall) {
-			roundRectPath(ctx, boxX, boxY, boxW, boxH, 12);
-			ctx.fillStyle = 'rgba(0, 0, 0, 0.74)';
-			ctx.fill();
-
-			ctx.font = 'bold 13px sans-serif';
-			ctx.fillStyle = '#ffffff';
-			ctx.fillText('ETAPPEN / STOPPS', boxX + pad + 2, boxY + 21);
-
-			const drawRow = (
-				s: (typeof resolvedStops)[number],
-				i: number,
-				x: number,
-				y: number,
-				maxW: number
-			) => {
+			const entries = resolvedStops.map((s, i) => {
 				const isStart = i === 0;
 				const isEnd = i === resolvedStops.length - 1;
-				const cy = y - 4;
-				ctx.beginPath();
-				ctx.arc(x + 10, cy, 10, 0, Math.PI * 2);
-				ctx.fillStyle = isStart
-					? '#22c55e'
-					: isEnd
-						? '#0f172a'
-						: s.pause
-							? '#38bdf8'
-							: '#fbbf24';
-				ctx.fill();
-				ctx.lineWidth = 2;
-				ctx.strokeStyle = s.pause || isEnd ? '#0f172a' : '#ffffff';
-				ctx.stroke();
-				ctx.fillStyle = isStart || isEnd ? '#ffffff' : '#0f172a';
-				ctx.font = 'bold 11px sans-serif';
-				ctx.textAlign = 'center';
-				ctx.textBaseline = 'middle';
-				ctx.fillText(String(i + 1), x + 10, cy + 0.5);
-				ctx.textAlign = 'left';
-				ctx.textBaseline = 'alphabetic';
-
-				// Tags reserveren Platz
 				let tagW = 0;
 				const tags: Array<[string, string, string]> = [];
 				if (isStart) tags.push(['Start', '#22c55e', '#ffffff']);
@@ -836,37 +864,62 @@ let casingLine: L.Polyline | undefined;
 				ctx.font = 'bold 9.5px sans-serif';
 				for (const [label] of tags) tagW += ctx.measureText(label).width + 10;
 				if (tags.length) tagW += 4 * (tags.length - 1) + 4;
+				const lines = rowsFor(s.name, tagW);
+				return { s, i, tags, lines };
+			});
 
-				// Name ggf. kürzen
-				ctx.font = '12.5px sans-serif';
-				const maxName = maxW - 34 - tagW;
-				let name = s.name;
-				while (name.length > 3 && ctx.measureText(name + '…').width > maxName) {
-					name = name.slice(0, -1);
-				}
-				if (name !== s.name) name += '…';
+			const boxH = headH + entries.reduce((sum, e) => sum + e.lines.length * lineH + 6, 0) + 6;
+			const boxX = Math.max(4, Math.min(exportLayout.legendX, cssW - boxW - 4));
+			const boxY = Math.max(4, Math.min(exportLayout.legendY, cssH - boxH - 4));
+
+			roundRectPath(ctx, boxX, boxY, boxW, boxH, 12);
+			ctx.fillStyle = 'rgba(0, 0, 0, 0.74)';
+			ctx.fill();
+
+			ctx.font = 'bold 13px sans-serif';
+			ctx.fillStyle = '#ffffff';
+			ctx.fillText('ETAPPEN / STOPPS', boxX + listPad + 2, boxY + 21);
+
+			let yy = boxY + headH + 4;
+			ctx.textAlign = 'left';
+			for (const e of entries) {
+				const cy = yy + 12 - 4;
+				const isStart = e.i === 0;
+				const isEnd = e.i === resolvedStops.length - 1;
+				ctx.beginPath();
+				ctx.arc(boxX + listPad + 10, cy, 10, 0, Math.PI * 2);
+				ctx.fillStyle = isStart ? '#22c55e' : isEnd ? '#0f172a' : e.s.pause ? '#38bdf8' : '#fbbf24';
+				ctx.fill();
+				ctx.lineWidth = 2;
+				ctx.strokeStyle = e.s.pause || isEnd ? '#0f172a' : '#ffffff';
+				ctx.stroke();
+				ctx.fillStyle = isStart || isEnd ? '#ffffff' : '#0f172a';
+				ctx.font = 'bold 11px sans-serif';
+				ctx.textAlign = 'center';
+				ctx.textBaseline = 'middle';
+				ctx.fillText(String(e.i + 1), boxX + listPad + 10, cy + 0.5);
+				ctx.textAlign = 'left';
+				ctx.textBaseline = 'alphabetic';
+
 				ctx.font = '12.5px sans-serif';
 				ctx.fillStyle = '#ffffff';
-				ctx.fillText(name, x + 26, y);
+				e.lines.forEach((line, li) => {
+					ctx.fillText(line, boxX + listPad + 26, yy + 12 + li * lineH);
+				});
 
-				// Tags zeichnen
-				let tx = x + 26 + ctx.measureText(name).width + 6;
-				for (const [label, bg, fg] of tags) {
-					ctx.font = 'bold 9.5px sans-serif';
+				let tx = boxX + boxW - listPad;
+				ctx.font = 'bold 9.5px sans-serif';
+				for (const [label, bg, fg] of [...e.tags].reverse()) {
 					const tw = ctx.measureText(label).width + 10;
-					roundRectPath(ctx, tx, y - 10.5, tw, 13, 4);
+					tx -= tw;
+					roundRectPath(ctx, tx, yy + 12 - 10.5, tw, 13, 4);
 					ctx.fillStyle = bg;
 					ctx.fill();
 					ctx.fillStyle = fg;
-					ctx.fillText(label, tx + 5, y - 1);
-						tx += tw + 4;
+					ctx.fillText(label, tx + 5, yy + 12 - 1);
+					tx -= 4;
 				}
-			};
-
-			const rowMaxW = resolvedStops.length > 16 ? (boxW - pad) / 2 - 10 : boxW - pad * 2;
-			resolvedStops.forEach((s, i) => {
-				drawRow(s, i, positions[i].x, positions[i].y, rowMaxW);
-			});
+				yy += e.lines.length * lineH + 6;
 			}
 		}
 
@@ -875,17 +928,20 @@ let casingLine: L.Polyline | undefined;
 		ctx.fillStyle = 'rgba(255,255,255,0.85)';
 		ctx.fillText('Kartendaten © Esri, Maxar, Earthstar Geographics', 12, cssH - 10);
 
-		// 7) Ansicht wiederherstellen
-		mapEl.setAttribute('style', prevStyle);
-		map.invalidateSize();
-		map.setView(prevCenter, prevZoom);
+		// 7) Ansicht wiederherstellen (im Export-Editor bleibt die gewählte Ansicht)
+		if (frameInner) frameInner.style.transform = frameTransform;
+		if (!exportOpen) {
+			mapEl.setAttribute('style', prevStyle);
+			map.invalidateSize();
+			map.setView(prevCenter, prevZoom);
+		}
 
 		return { dataUrl: canvas.toDataURL('image/png'), width: canvas.width, height: canvas.height };
 	}
 
 async function savePng() {
-		if (busy) return;
-		busy = true;
+		if (busy || exportBusy) return;
+		exportBusy = true;
 		errorMessage = '';
 		try {
 			progressText = 'Karte wird erzeugt …';
@@ -897,7 +953,7 @@ async function savePng() {
 		} catch (e) {
 			errorMessage = e instanceof Error ? e.message : 'Export fehlgeschlagen';
 		} finally {
-			busy = false;
+			exportBusy = false;
 			progressText = '';
 		}
 	}
@@ -920,12 +976,12 @@ async function savePng() {
 
 	/** Erzeugt ein A4-Hochformat-PDF mit Karte, Kopfzeile und Stoppliste. */
 	async function savePdf() {
-		if (busy) return;
+		if (busy || exportBusy) return;
 		if (resolvedStops.length < 2) {
 			errorMessage = 'Bitte zuerst eine Route berechnen.';
 			return;
 		}
-		busy = true;
+		exportBusy = true;
 		errorMessage = '';
 		try {
 			progressText = 'PDF wird erzeugt …';
@@ -939,18 +995,18 @@ async function savePng() {
 		} catch (e) {
 			errorMessage = e instanceof Error ? e.message : 'PDF-Export fehlgeschlagen';
 		} finally {
-			busy = false;
+			exportBusy = false;
 			progressText = '';
 		}
 	}
 
 	async function printMap() {
-		if (busy) return;
+		if (busy || exportBusy) return;
 		if (resolvedStops.length < 2) {
 			errorMessage = 'Bitte zuerst eine Route berechnen.';
 			return;
 		}
-		busy = true;
+		exportBusy = true;
 		errorMessage = '';
 		try {
 			progressText = 'Karte wird vorbereitet …';
@@ -962,7 +1018,7 @@ async function savePng() {
 			errorMessage = e instanceof Error ? e.message : 'Druck fehlgeschlagen';
 			printing = false;
 		} finally {
-			busy = false;
+			exportBusy = false;
 			progressText = '';
 		}
 	}
@@ -974,7 +1030,7 @@ async function savePng() {
 
 </script>
 
-<svelte:window onafterprint={onAfterPrint} />
+<svelte:window onafterprint={onAfterPrint} onresize={updateFrameScale} />
 
 <svelte:head>
 	<title>Maximap – Routenplaner für Gemeinschaftsfahrten</title>
@@ -1150,10 +1206,7 @@ async function savePng() {
 				</CardContent>
 				<CardFooter class="flex flex-wrap gap-2">
 					<Button onclick={computeRoute} disabled={busy}>Route berechnen</Button>
-					<Button variant="outline" onclick={() => (saveOpen = true)} disabled={busy}
-						>Speichern …</Button
-					>
-					<Button variant="outline" onclick={printMap} disabled={busy}>Drucken (A4)</Button>
+					<Button variant="outline" onclick={openExport} disabled={busy}>Export / Drucken (A4)</Button>
 				</CardFooter>
 			</Card>
 		{:else}
@@ -1197,56 +1250,145 @@ async function savePng() {
 	{/if}
 </div>
 
-<!-- Speichern-Dialog -->
-<Dialog.Root bind:open={saveOpen}>
-	<Dialog.Content class="sm:max-w-[420px]">
-		<Dialog.Header>
-			<Dialog.Title>Karte speichern</Dialog.Title>
-			<Dialog.Description>Wie möchtest du die Karte exportieren?</Dialog.Description>
-		</Dialog.Header>
-		<div class="grid gap-3">
-			<button
-				type="button"
-				class="border-input hover:bg-accent hover:text-accent-foreground flex items-center gap-3 rounded-lg border p-4 text-left transition-colors"
-				onclick={() => {
-					saveOpen = false;
-					savePng();
-				}}
-			>
-				<span class="text-2xl">🖼️</span>
-				<span>
-					<span class="block text-sm font-semibold">PNG-Bild</span>
-					<span class="text-muted-foreground block text-xs"
-						>Karte als Bilddatei in hoher Auflösung</span
-					>
-				</span>
-			</button>
-			<button
-				type="button"
-				class="border-input hover:bg-accent hover:text-accent-foreground flex items-center gap-3 rounded-lg border p-4 text-left transition-colors"
-				onclick={() => {
-					saveOpen = false;
-					savePdf();
-				}}
-			>
-				<span class="text-2xl">📄</span>
-				<span>
-					<span class="block text-sm font-semibold">PDF (A4 Hochformat)</span>
-					<span class="text-muted-foreground block text-xs"
-						>Fertig formatiertes Dokument mit Logo, Titel und Stoppliste</span
-					>
-				</span>
-			</button>
-		</div>
-		{#if busy}<p class="text-muted-foreground mt-3 text-sm">{progressText}</p>{/if}
-		{#if errorMessage}<p class="text-destructive mt-3 text-sm">{errorMessage}</p>{/if}
-		<Dialog.Close
-			class="text-muted-foreground hover:text-foreground absolute top-4 right-4 text-sm">✕</Dialog.Close
-		>
-	</Dialog.Content>
-</Dialog.Root>
 
 <!-- Druck-Layout: A4 Hochformat (Karte füllt die Seite, Overlays sind im Bild) -->
+<!-- Export-Editor: A4-Vorschau mit verschiebbaren Elementen -->
+{#if exportOpen}
+	<div class="fixed inset-0 z-[4000] flex flex-col bg-black/80 backdrop-blur-sm">
+		<!-- Kopfzeile -->
+		<div class="flex flex-wrap items-center gap-2 px-4 py-2 text-white">
+			<span class="text-sm font-semibold">Export-Vorschau (A4 Hochformat)</span>
+			<span class="text-muted-foreground hidden text-xs sm:inline"
+				>· Elemente ziehen zum Verschieben, Eckgriff zum Skalieren, Karte frei verschieben/zoomen</span
+			>
+			<div class="ml-auto flex flex-wrap items-center gap-2">
+				<Button variant="outline" size="sm" class="bg-slate-800 text-white hover:bg-slate-700 hover:text-white dark:bg-input/30 dark:text-foreground" onclick={fitRouteInFrame}>Route einpassen</Button>
+				<Button variant="outline" size="sm" class="bg-slate-800 text-white hover:bg-slate-700 hover:text-white dark:bg-input/30 dark:text-foreground" onclick={resetExportLayout}>Layout zurücksetzen</Button>
+				<Button variant="outline" size="sm" class="bg-slate-800 text-white hover:bg-slate-700 hover:text-white dark:bg-input/30 dark:text-foreground" onclick={closeExport}>Fertig</Button>
+			</div>
+		</div>
+		<!-- A4-Bühne -->
+		<div class="flex min-h-0 flex-1 items-center justify-center overflow-hidden p-4">
+			<div style="width:{A4_W * frameScale}px;height:{A4_H * frameScale}px" class="relative">
+				<div
+					bind:this={frameInner}
+					style="width:{A4_W}px;height:{A4_H}px;transform:scale({frameScale});transform-origin:top left"
+					class="absolute top-0 left-0 overflow-hidden rounded-sm bg-black shadow-2xl ring-1 ring-white/30"
+				>
+					<div bind:this={frameHost} class="relative h-full w-full"></div>
+
+					<!-- Titelbox -->
+					{#if title.trim()}
+						<div
+							role="button"
+							tabindex="0"
+							aria-label="Titelbox verschieben"
+							class="export-hit absolute cursor-move rounded-xl bg-slate-900/88 px-3.5 py-2 {dragTarget === 'title' ? 'ring-2 ring-amber-400' : 'hover:ring-2 hover:ring-white/60'}"
+							style="left:{exportLayout.titleX}px;top:{exportLayout.titleY}px"
+							onpointerdown={(e) => startOverlayDrag(e, 'title', 'move')}
+							onpointermove={onOverlayDrag}
+							onpointerup={endOverlayDrag}
+							onpointercancel={endOverlayDrag}
+						>
+							<p class="text-2xl leading-tight font-bold text-white">{title}</p>
+							{#if tripDate.trim() || routeDistanceKm !== null}
+								<p class="text-[13px] text-slate-300">
+									{[tripDate.trim(), routeDistanceKm !== null ? `Gesamtstrecke: ca. ${routeDistanceKm.toFixed(0)} km` : ''].filter(Boolean).join(' · ')}
+								</p>
+							{/if}
+						</div>
+					{/if}
+
+					<!-- Logo -->
+					{#if showLogo}
+						<div
+							role="button"
+							tabindex="0"
+							aria-label="Logo verschieben"
+							class="export-hit absolute cursor-move {dragTarget === 'logo' ? 'ring-2 ring-amber-400' : 'hover:ring-2 hover:ring-white/60'}"
+							style="left:{exportLayout.logoX}px;top:{exportLayout.logoY}px;width:{exportLayout.logoW}px"
+							onpointerdown={(e) => startOverlayDrag(e, 'logo', 'move')}
+							onpointermove={onOverlayDrag}
+							onpointerup={endOverlayDrag}
+							onpointercancel={endOverlayDrag}
+						>
+							<img src="/logo.png" alt="Vereinslogo" style="width:{exportLayout.logoW}px" />
+							<button
+								type="button"
+								class="absolute -right-1 -bottom-1 h-4 w-4 cursor-nwse-resize rounded-sm bg-amber-400 opacity-80"
+								aria-label="Logo-Größe ändern"
+								onpointerdown={(e) => startOverlayDrag(e, 'logo', 'resize')}
+								onpointermove={onOverlayDrag}
+								onpointerup={endOverlayDrag}
+								onpointercancel={endOverlayDrag}></button>
+						</div>
+					{/if}
+
+					<!-- Stoppliste -->
+					<div
+						role="button"
+						tabindex="0"
+						aria-label="Stoppliste verschieben"
+						class="export-hit absolute cursor-move rounded-xl bg-black/74 {dragTarget === 'legend' ? 'ring-2 ring-amber-400' : 'hover:ring-2 hover:ring-white/60'}"
+						style="left:{exportLayout.legendX}px;top:{exportLayout.legendY}px;width:{exportLayout.legendW}px"
+						onpointerdown={(e) => startOverlayDrag(e, 'legend', 'move')}
+						onpointermove={onOverlayDrag}
+						onpointerup={endOverlayDrag}
+						onpointercancel={endOverlayDrag}
+					>
+						<p class="px-3.5 pt-1.5 pb-1 text-[13px] font-bold tracking-wide text-white uppercase">Etappen / Stopps</p>
+						<div class="px-3 pb-1.5">
+							{#each resolvedStops as s, i (i)}
+								<div class="mb-1.5 flex items-start gap-1.5">
+									<span
+										class="mt-0.5 inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[11px] font-bold {i === 0
+											? 'bg-green-500 text-white'
+											: i === resolvedStops.length - 1
+												? 'bg-slate-900 text-white ring-2 ring-white'
+												: s.pause
+													? 'bg-sky-400 text-slate-900'
+													: 'bg-amber-400 text-slate-900'}">{i + 1}</span
+									>
+									<p class="min-w-0 flex-1 text-[12.5px] leading-4 text-white">
+										{#if i === 0 || i === resolvedStops.length - 1 || s.pause}
+											<span class="float-right ml-1 inline-flex gap-1">
+												{#if i === 0}<span class="rounded bg-green-500 px-1.5 py-px text-[9.5px] font-bold text-white">Start</span>{/if}
+												{#if i === resolvedStops.length - 1}<span class="rounded bg-slate-700 px-1.5 py-px text-[9.5px] font-bold text-white">Ziel</span>{/if}
+												{#if s.pause}<span class="rounded bg-sky-400 px-1.5 py-px text-[9.5px] font-bold text-slate-900">Pause</span>{/if}
+											</span>
+										{/if}
+										{s.name}
+									</p>
+								</div>
+							{/each}
+						</div>
+						<button
+							type="button"
+							class="absolute -right-1.5 -bottom-1.5 h-5 w-5 cursor-nwse-resize rounded-sm bg-amber-400 opacity-80"
+							aria-label="Liste breiter/schmaler machen"
+							onpointerdown={(e) => startOverlayDrag(e, 'legend', 'resize')}
+							onpointermove={onOverlayDrag}
+							onpointerup={endOverlayDrag}
+							onpointercancel={endOverlayDrag}></button>
+					</div>
+				</div>
+			</div>
+		</div>
+		<!-- Fußzeile mit Export-Aktionen -->
+		<div class="flex flex-wrap items-center justify-center gap-2 px-4 py-3">
+			<Button onclick={savePng} disabled={exportBusy}>🖼️ PNG speichern</Button>
+			<Button onclick={savePdf} disabled={exportBusy}>📄 PDF speichern</Button>
+			<Button variant="outline" class="bg-slate-800 text-white hover:bg-slate-700 hover:text-white" onclick={printMap} disabled={exportBusy}>🖨️ Drucken</Button>
+			{#if exportBusy}
+				<span class="text-muted-foreground text-sm">{progressText}</span>
+			{/if}
+			{#if errorMessage}
+				<span class="text-destructive text-sm">{errorMessage}</span>
+			{/if}
+		</div>
+	</div>
+{/if}
+
 {#if printing}
 	<div class="print-sheet">
 		<img src={printImage} alt="Routenkarte" />
