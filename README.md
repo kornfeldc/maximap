@@ -22,6 +22,20 @@ Einfaches Tool für Motorradclubs: Orte eingeben, Route auf Satellitenkarte anse
 | Nominatim (OSM) | Ortssuche | max. 1 Anfrage/Sekunde (wird eingehalten) |
 | Photon (Komoot) | Ortssuche-Fallback | greift automatisch, wenn Nominatim blockiert |
 
+## Tech-Stack
+
+- **SvelteKit 2** mit **Svelte 5** (Runes-Modus)
+- **TypeScript** (geprüft via `svelte-check`)
+- **Tailwind CSS v4** (CSS-basierte Konfiguration)
+- **shadcn-svelte**-Komponenten (bits-ui)
+- **Leaflet** für die Satellitenkarte
+- **jspdf** für den PNG-Export
+- **Vite** als Build-Tool
+
+## vibe coded
+
+Diese App wurde vollständig **vibe coded** – mit [Orca ADE](https://www.onorca.dev/) als Umgebung, [Crush](https://charm.land/) als Harness und [GLM 5.3 Flash](https://z.ai/model-api) als Modell.
+
 ## Entwicklung
 
 ```bash
